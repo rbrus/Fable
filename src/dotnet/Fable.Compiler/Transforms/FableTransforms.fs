@@ -199,9 +199,13 @@ let countReferences limit identName body =
         | _ -> false) |> ignore
     count
 
-let canInlineArg identName value body =
-    // Don't erase expressions referenced 0 times, they may have side-effects
-    not(hasDoubleEvalRisk value) || (countReferences 1 identName body = 1)
+let canInlineArg identName value (body: Expr) =
+    not(hasDoubleEvalRisk value)
+        || (match value, body.Type with
+            | Function _, _ -> countReferences 1 identName body <= 1
+            | _, FunctionType _ -> false
+            // Don't erase expressions referenced 0 times, they may have side-effects
+            | _ -> countReferences 1 identName body = 1)
 
 module private Transforms =
     let (|LambdaOrDelegate|_|) = function
