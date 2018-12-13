@@ -49,7 +49,8 @@ let makeProjectOptions project sources otherOptions: FSharpProjectOptions =
       ExtraProjectInfo = None
       Stamp = None }
 
-let getProjectOptionsFromScript (checker: FSharpChecker) (define: string[]) scriptFile =
+let getProjectOptionsFromScript (checker: FSharpChecker) (define: string[]) scriptFile
+        : CrackedFsproj list * CrackedFsproj =
     let otherFlags = [|
         yield "--target:library"
 #if !NETFX
@@ -57,15 +58,25 @@ let getProjectOptionsFromScript (checker: FSharpChecker) (define: string[]) scri
 #endif
         for constant in define do yield "--define:" + constant
     |]
-    checker.GetProjectOptionsFromScript(scriptFile, File.ReadAllText scriptFile,
+    checker.GetProjectOptionsFromScript(scriptFile, File.readAllTextNonBlocking scriptFile,
                                         assumeDotNetFramework=false, otherFlags=otherFlags)
     |> Async.RunSynchronously
     |> fun (opts, _errors) ->
         // TODO: Check errors
-        opts.OtherOptions
-        |> makeProjectOptions scriptFile opts.SourceFiles
+        let otherOptions =
+            opts.OtherOptions
+            // HACK to fix https://github.com/fsharp/FSharp.Compiler.Service/issues/847
+            |> Array.map (fun x -> x.Replace("System.Private.CoreLib.dll", "System.Runtime.dll"))
+        [], { ProjectFile = opts.ProjectFileName
+              SourceFiles = List.ofArray opts.SourceFiles
+              ProjectReferences = []
+              DllReferences = []
+              PackageReferences = []
+              OtherCompilerOptions = List.ofArray otherOptions }
 
-let getBasicCompilerArgs (define: string[]) =
+let getBasicCompilerArgs (define: string[]) (projFile: string) =
+    if projFile.EndsWith(".fsx") then [||]
+    else
     [|
         // yield "--debug"
         // yield "--debug:portable"
@@ -280,11 +291,10 @@ let getCrackedProjectsFromMainFsproj (projFile: string) =
         |> List.distinctBy (fun x -> x.ProjectFile)
     refProjs, mainProj
 
-let getCrackedProjects (checker: FSharpChecker) (projFile: string) =
+let getCrackedProjects (checker: FSharpChecker) define (projFile: string) =
     match (Path.GetExtension projFile).ToLower() with
     | ".fsx" ->
-        // getProjectOptionsFromScript checker define projFile
-        failwith "Parsing .fsx scripts is not currently possible, please use a .fsproj project"
+        getProjectOptionsFromScript checker define projFile
     | ".fsproj" ->
         getCrackedProjectsFromMainFsproj projFile
     | s -> failwithf "Unsupported project type: %s" s
@@ -293,11 +303,11 @@ let getCrackedProjects (checker: FSharpChecker) (projFile: string) =
 // file for changes. In some cases that editor will lock the file which can cause fable to
 // get a read error. If that happens the lock is usually brief so we can reasonably wait
 // for it to be released.
-let retryGetCrackedProjects (checker: FSharpChecker) (projFile: string) =
+let retryGetCrackedProjects (checker: FSharpChecker) define (projFile: string) =
     let retryUntil = (DateTime.Now + TimeSpan.FromSeconds 2.)
     let rec retry () =
         try
-            getCrackedProjects checker projFile
+            getCrackedProjects checker define projFile
         with
         | :? IOException as ioex ->
             if retryUntil > DateTime.Now then
@@ -361,7 +371,7 @@ let getFullProjectOpts (checker: FSharpChecker) (define: string[]) (rootDir: str
     let projFile = Path.GetFullPath(projFile)
     if not(File.Exists(projFile)) then
         failwith ("File does not exist: " + projFile)
-    let projRefs, mainProj = retryGetCrackedProjects checker projFile
+    let projRefs, mainProj = retryGetCrackedProjects checker define projFile
     let fableLibraryPath, pkgRefs =
         copyFableLibraryAndPackageSources rootDir mainProj.PackageReferences
     let projOpts =
@@ -390,7 +400,7 @@ let getFullProjectOpts (checker: FSharpChecker) (define: string[]) (rootDir: str
             // We only keep dllRefs for the main project
             let dllRefs = [| for r in mainProj.DllReferences -> "-r:" + r |]
             let otherOpts = mainProj.OtherCompilerOptions |> Array.ofList
-            [ getBasicCompilerArgs define
+            [ getBasicCompilerArgs define projFile
               otherOpts
               dllRefs ]
             |> Array.concat
